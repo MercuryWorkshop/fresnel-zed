@@ -362,17 +362,53 @@ fn init_embed_windows(app_state: Arc<AppState>, cx: &mut gpui::App) {
                     let _ = task.await;
                 } else if path.starts_with("slop2://") {
                     // A remote project: the host asked for a machine + path
-                    // rather than a local directory. `open_remote_project` opens
-                    // exactly one window when nothing is requesting one, so that
-                    // window is the one this connection binds to.
+                    // rather than a local directory. Only the window is awaited
+                    // here — it is what binds this connection. The connection
+                    // itself runs detached: a failed one waits on a Retry/Cancel
+                    // prompt, and awaiting that would leave every later
+                    // connection without a window.
                     match zed::parse_slop2_url(&path) {
                         Ok((connection_options, remote_path)) => {
                             let paths = urlencoding::decode(&remote_path)
                                 .map(|path| vec![std::path::PathBuf::from(path.into_owned())])
                                 .unwrap_or_default();
-                            open_remote_project(connection_options, paths, app_state, options, cx)
+                            let window = cx
+                                .update(|cx| {
+                                    workspace::Workspace::new_local(
+                                        Vec::new(),
+                                        app_state.clone(),
+                                        None,
+                                        None,
+                                        None,
+                                        options.open_mode,
+                                        cx,
+                                    )
+                                })
                                 .await
-                                .log_err();
+                                .map(|opened| opened.window);
+                            match window {
+                                Ok(window) => {
+                                    let options = workspace::OpenOptions {
+                                        requesting_window: Some(window),
+                                        ..options
+                                    };
+                                    cx.spawn(async move |cx| {
+                                        open_remote_project(
+                                            connection_options,
+                                            paths,
+                                            app_state,
+                                            options,
+                                            cx,
+                                        )
+                                        .await
+                                        .log_err();
+                                    })
+                                    .detach();
+                                }
+                                Err(error) => {
+                                    log::error!("embed window for {path}: {error:#}");
+                                }
+                            }
                         }
                         Err(error) => {
                             log::error!("embed host asked for {path}: {error:#}");
