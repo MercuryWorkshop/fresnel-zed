@@ -16,7 +16,9 @@
 //!
 //! Note this keeps rendering on the *native* driver. The Vulkan export route
 //! would have forced the whole UI onto the Mesa-on-D3D12 adapter, since that is
-//! the only one here implementing `VK_KHR_external_memory_win32`.
+//! the only one here with working `VK_KHR_external_memory_win32`. Newer Adreno
+//! drivers do advertise the extension, but importing a `D3D12_RESOURCE` handle
+//! through it fails — see `prefer_gpu_renderer` on the consumer side.
 
 use std::cell::Cell;
 

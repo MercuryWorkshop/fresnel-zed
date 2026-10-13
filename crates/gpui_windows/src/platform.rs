@@ -56,26 +56,38 @@ pub struct WindowsPlatform {
     has_package_identity: bool,
     app_identity: RefCell<Option<(String, String)>>,
     system_notifications: RefCell<SystemNotificationState>,
-    /// Present only when `ZED_EMBED_PIPE` named a pipe to serve. Holds the
-    /// D3D12-backed devices the embed renders through and the connected pipe.
-    embed: Option<EmbedSession>,
+    /// Present only when `ZED_EMBED_SOCKET` named a pipe to serve. Holds the
+    /// D3D12-backed devices every embed window renders through.
+    embed: Option<EmbedHost>,
 }
 
-/// The pieces an embed session needs before its window exists. The window is
-/// created later, by `open_window`, because GPUI owns window lifetime.
-struct EmbedSession {
+/// Send whatever cursor the work just done asked for to one window's consumer.
+///
+/// GPUI sets the cursor several times per paint, and `set_cursor_style` names no
+/// window, so the producer stashes the latest in `PENDING_CURSOR` and the pumps
+/// flush it: clear the slot, do one window's work, send what landed. `last` is
+/// that window's last-sent name, so an unchanged cursor costs no message.
+fn flush_embed_cursor(pipe: &EmbedPipe, last: &Cell<Option<&'static str>>) {
+    let Some(name) = *crate::embed::PENDING_CURSOR.lock() else {
+        return;
+    };
+    if last.get() == Some(name) {
+        return;
+    }
+    match crate::embed::send_cursor(pipe, name) {
+        Ok(()) => last.set(Some(name)),
+        Err(error) => log::error!("[zed-embed] cursor update failed: {error:#}"),
+    }
+}
+
+/// What embed mode owns for the whole process: the devices its windows render
+/// through. The connections do NOT live here — one editor serves every pane, so
+/// each window binds its own, popped from the accept loop's queue by
+/// `open_window` (GPUI owns window lifetime, so that is the earliest a window
+/// exists to bind one to).
+struct EmbedHost {
     devices: Rc<SharedTextureDevices>,
     directx_devices: DirectXDevices,
-    pipe: Arc<EmbedPipe>,
-    /// Whether a window has already taken this connection.
-    ///
-    /// Zed opens windows of its own accord -- settings being the obvious one --
-    /// and every one of them reaches `open_window`. Binding a second window to
-    /// the same pipe would put two reader threads on one stream and send the
-    /// consumer a second handshake, which kills the session. Only the first
-    /// window is the embed; the rest open as ordinary on-screen windows, which is
-    /// also what makes zed's settings usable here.
-    claimed: Cell<bool>,
 }
 
 struct WindowsPlatformInner {
@@ -133,18 +145,18 @@ impl WindowsPlatform {
     fn open_embed_window(
         &self,
         options: WindowParams,
-        session: &EmbedSession,
+        host: &EmbedHost,
+        pipe: Arc<EmbedPipe>,
     ) -> Result<Box<dyn PlatformWindow>> {
         let display = Rc::new(EmbedDisplay::new()) as Rc<dyn PlatformDisplay>;
-        let consumer = session
-            .pipe
+        let consumer = pipe
             .consumer_process()
             .context("Identifying the embed consumer process")?;
         let window = EmbedWindow::new(
             options,
             display,
-            session.devices.clone(),
-            &session.directx_devices,
+            host.devices.clone(),
+            &host.directx_devices,
             consumer,
         )?;
 
@@ -156,48 +168,120 @@ impl WindowsPlatform {
             .context("Sharing the frame fence with the consumer")?;
         // Mode byte first, then the handshake: that is the order the consumer
         // reads them in.
-        crate::embed::send_mode(&session.pipe, true).context("Sending the transport mode")?;
-        crate::embed::send_handshake(&session.pipe, handles[0], width, height)
+        crate::embed::send_mode(&pipe, true).context("Sending the transport mode")?;
+        crate::embed::send_handshake(&pipe, handles[0], width, height)
             .context("Sending the embed handshake")?;
-        crate::embed::send_shared_extra(&session.pipe, handles[1], fence)
+        crate::embed::send_shared_extra(&pipe, handles[1], fence)
             .context("Sending the second buffer and the frame fence")?;
 
-        let pipe = session.pipe.clone();
+        // A copy made inside the editor goes to the consumer that connected
+        // last, so this window claims that role as it binds — the same
+        // last-one-wins rule the Linux producer uses for its clipboard writer.
+        *crate::embed::CLIPBOARD_PIPE.lock() = Some(pipe.clone());
+
+        let frame_pipe = pipe.clone();
         window.set_on_frame(Box::new(move |index, width, height, fence_value| {
             // Value first: the consumer applies the most recent one to the next
             // `RDY!`, so sending it after would leave that frame unsynchronised.
-            if let Err(error) = crate::embed::send_fence_value(&pipe, fence_value) {
+            if let Err(error) = crate::embed::send_fence_value(&frame_pipe, fence_value) {
                 log::error!("[zed-embed] fence value failed: {error:#}");
                 return;
             }
-            if let Err(error) = crate::embed::send_ready(&pipe, index as u32, width, height) {
+            if let Err(error) = crate::embed::send_ready(&frame_pipe, index as u32, width, height)
+            {
                 log::error!("[zed-embed] frame notification failed: {error:#}");
             }
         }));
         // A resize reallocates the targets, so the consumer needs new handles.
         // The fence survives it, so it is not re-sent.
-        let pipe = session.pipe.clone();
+        let reshare_pipe = pipe.clone();
         window.set_on_reshare(Box::new(move |handles, width, height| {
-            if let Err(error) = crate::embed::send_handshake(&pipe, handles[0], width, height) {
+            if let Err(error) =
+                crate::embed::send_handshake(&reshare_pipe, handles[0], width, height)
+            {
                 log::error!("[zed-embed] re-handshake after resize failed: {error:#}");
                 return;
             }
             // Fence 0: unchanged by the reallocation, so the consumer keeps the
             // one it already holds.
-            if let Err(error) = crate::embed::send_shared_extra(&pipe, handles[1], 0) {
+            if let Err(error) = crate::embed::send_shared_extra(&reshare_pipe, handles[1], 0) {
                 log::error!("[zed-embed] re-sharing the second buffer failed: {error:#}");
             }
         }));
-        let pipe = session.pipe.clone();
+        let title_pipe = pipe.clone();
         window.set_on_title_change(Box::new(move |title| {
-            if let Err(error) = crate::embed::send_title(&pipe, title) {
+            if let Err(error) = crate::embed::send_title(&title_pipe, title) {
                 log::error!("[zed-embed] title update failed: {error:#}");
             }
         }));
 
-        let receiver = crate::embed::spawn_reader(session.pipe.clone());
-        let cursor_pipe = session.pipe.clone();
+        let (input_tx, mut input_rx) = futures::channel::mpsc::channel::<()>(1);
+        let receiver = crate::embed::spawn_reader(pipe.clone(), input_tx);
+        let cursor_pipe = pipe;
         let weak = window.downgrade();
+        // Which window a cursor belongs to, shared by the two pumps below. Both
+        // run on the one foreground thread, so a `Cell` is all the sharing needs.
+        let last_cursor: Rc<Cell<Option<&'static str>>> = Rc::new(Cell::new(None));
+
+        // Input is pumped by ARRIVAL, not by the frame clock.
+        //
+        // Draining it from the clock below looked tidier and was wrong twice
+        // over: it quantised every message to the render rate, and a dropped
+        // tick -- which is what a busy foreground does, by design -- dropped
+        // that drain with it. A trackpad reports faster than 60Hz, and the
+        // editor re-decides which axis a gesture is locked to after a pause of
+        // 28ms, so the gaps a skipped tick opens up re-lock the axis mid-flick:
+        // the scroll snaps, stalls, or slides sideways. A native window has no
+        // such coupling -- `WM_MOUSEWHEEL` is dispatched when it arrives -- and
+        // now neither does this one.
+        self.foreground_executor()
+            .spawn({
+                let weak = weak.clone();
+                let cursor_pipe = cursor_pipe.clone();
+                let last_cursor = last_cursor.clone();
+                async move {
+                    let mut input_state = crate::embed::EmbedInputState::default();
+                    loop {
+                        use futures::StreamExt as _;
+                        // `None` means the reader thread is gone, which is how a
+                        // consumer that hung up reaches us. Whatever it managed
+                        // to send first is still drained below before closing.
+                        let alive = input_rx.next().await.is_some();
+                        let Some(window) = weak.upgrade() else {
+                            break;
+                        };
+                        let mut batch = Vec::new();
+                        let mut disconnected = !alive;
+                        loop {
+                            match receiver.try_recv() {
+                                Ok(input) => batch.push(input),
+                                Err(TryRecvError::Empty) => break,
+                                Err(TryRecvError::Disconnected) => {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                        crate::embed::coalesce_scrolls(&mut batch);
+                        // Same per-window cursor routing as the frame pump: clear
+                        // the shared slot, do this window's work, send what it
+                        // asked for.
+                        *crate::embed::PENDING_CURSOR.lock() = None;
+                        window.ensure_active();
+                        for input in batch {
+                            input_state.apply(input, &window);
+                        }
+                        flush_embed_cursor(&cursor_pipe, &last_cursor);
+                        if disconnected {
+                            log::info!("[zed-embed] consumer disconnected; closing");
+                            window.close();
+                            return;
+                        }
+                    }
+                }
+            })
+            .detach();
+
         // The frame clock gets its OWN thread rather than `background.timer`.
         //
         // That timer runs on the shared background pool — the same pool a
@@ -212,6 +296,9 @@ impl WindowsPlatform {
         // A plain sleeping thread cannot be starved by executor load. It only
         // paces; the work still happens on the foreground task below, because
         // GPUI requires it.
+        //
+        // Dropping a tick is now only ever a dropped FRAME. Input no longer rides
+        // on this clock, so a hitch costs a repaint and nothing else.
         let (tick_tx, mut tick_rx) = futures::channel::mpsc::channel::<()>(0);
         std::thread::Builder::new()
             .name("zed-embed-frame-clock".into())
@@ -233,8 +320,6 @@ impl WindowsPlatform {
             .ok();
         self.foreground_executor()
             .spawn(async move {
-                let mut input_state = crate::embed::EmbedInputState::default();
-                let mut last_cursor: Option<&'static str> = None;
                 loop {
                     // ~60Hz, paced by the thread above.
                     use futures::StreamExt as _;
@@ -244,33 +329,17 @@ impl WindowsPlatform {
                     let Some(window) = weak.upgrade() else {
                         break;
                     };
+                    // Clear the shared slot so this tick captures only the cursor
+                    // GPUI sets for THIS window's paint. `set_cursor_style` takes
+                    // no window argument, but the pumps run on the one foreground
+                    // thread and so never interleave — which is what makes
+                    // "whatever landed during my turn is mine" true, and what
+                    // keeps two panes from both showing the last-opened one's
+                    // cursor.
+                    *crate::embed::PENDING_CURSOR.lock() = None;
                     window.ensure_active();
-                    loop {
-                        match receiver.try_recv() {
-                            Ok(input) => {
-                                input_state.apply(input, &window);
-                            }
-                            Err(TryRecvError::Empty) => break,
-                            Err(TryRecvError::Disconnected) => {
-                                log::info!("[zed-embed] consumer disconnected; closing");
-                                window.close();
-                                return;
-                            }
-                        }
-                    }
-                    // Whatever this tick's layout asked for, at most one message.
-                    let pending = crate::embed::PENDING_CURSOR.lock().take();
-                    if let Some(name) = pending
-                        && last_cursor != Some(name)
-                    {
-                        match crate::embed::send_cursor(&cursor_pipe, name) {
-                            Ok(()) => last_cursor = Some(name),
-                            Err(error) => {
-                                log::error!("[zed-embed] cursor update failed: {error:#}")
-                            }
-                        }
-                    }
                     window.tick_frame();
+                    flush_embed_cursor(&cursor_pipe, &last_cursor);
                 }
             })
             .detach();
@@ -406,34 +475,23 @@ impl WindowsPlatform {
             HICON::default()
         };
 
-        // Blocks until the consumer connects, the same way the Linux client waits
-        // on its socket: there is nothing to render into until the shared texture
-        // can be handed over.
+        // An accept LOOP, not one connection, the same way the Linux client
+        // listens on its socket: one editor serves every pane, so a second pane
+        // is a second connection to this same name, and each one gets its own
+        // window. Waiting here for the first consumer instead would serve exactly
+        // one pane and hang every pane after it.
+        //
+        // Nothing blocks: the loop counts each connection through gpui, and
+        // `init_embed_windows` opens a window per count (which then pops the
+        // connection in `open_window`).
         let embed = match embed_devices {
             Some((name, devices)) => {
                 let directx_devices = directx_devices
                     .context("embed mode built no DirectX devices")?;
-                let pipe = Arc::new(EmbedPipe::serve(&name).context("Serving the embed pipe")?);
-                // Before anything else: the consumer opens with the project path.
-                match crate::embed::read_cwd(&pipe) {
-                    Ok(path) => {
-                        log::info!("[zed-embed] consumer connected on {name} for {path:?}");
-                        gpui::embed_palette::push_embed_path(path);
-                    }
-                    Err(error) => {
-                        log::error!("[zed-embed] reading the consumer's cwd: {error:#}");
-                    }
-                }
-                // Nothing opens a window until this is bumped: `init_embed_windows`
-                // polls the connection count and opens one window per new
-                // connection. Pushing the path without counting the connection
-                // leaves the app idle and the host pane blank.
-                gpui::embed_palette::note_embed_connection();
-                Some(EmbedSession {
+                crate::embed::spawn_listener(&name).context("Serving the embed pipe")?;
+                Some(EmbedHost {
                     devices,
                     directx_devices,
-                    pipe,
-                    claimed: Cell::new(false),
                 })
             }
             None => None,
@@ -791,10 +849,14 @@ impl Platform for WindowsPlatform {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
-        if let Some(session) = self.embed.as_ref()
-            && !session.claimed.replace(true)
+        // A window per queued connection. Zed also opens windows of its own
+        // accord — settings being the obvious one — and every one of them reaches
+        // here; with no connection waiting, those become ordinary on-screen
+        // windows, which is what makes zed's settings usable from a pane.
+        if let Some(host) = self.embed.as_ref()
+            && let Some(pipe) = crate::embed::take_pending_connection()
         {
-            return self.open_embed_window(options, session);
+            return self.open_embed_window(options, host, pipe);
         }
 
         let window = WindowsWindow::new(handle, options, self.generate_creation_info())?;
@@ -1058,7 +1120,7 @@ impl Platform for WindowsPlatform {
         // In an embed session this process has no clipboard of its own worth
         // writing to — the host owns the real system clipboard, so a copy is
         // forwarded there instead.
-        if let Some(session) = self.embed.as_ref() {
+        if self.embed.is_some() {
             if let Some(text) = item.text() {
                 // Cache locally as well, exactly as the Linux headless path does.
                 // Forwarding alone is not enough: the host records the text
@@ -1069,7 +1131,10 @@ impl Platform for WindowsPlatform {
                 // this, copying inside the embed and pasting inside the embed
                 // yields whatever the host last pushed, or nothing at all.
                 *crate::embed::CLIPBOARD_CACHE.lock() = Some(text.clone());
-                if let Err(error) = crate::embed::send_clipboard(&session.pipe, &text) {
+                let pipe = crate::embed::CLIPBOARD_PIPE.lock().clone();
+                if let Some(pipe) = pipe
+                    && let Err(error) = crate::embed::send_clipboard(&pipe, &text)
+                {
                     log::error!("[zed-embed] forwarding a copy to the host failed: {error:#}");
                 }
             }

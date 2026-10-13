@@ -11,6 +11,7 @@
 //! I/O on the file object, so a blocking read on the reader thread would stall
 //! every frame notification behind it.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -153,13 +154,6 @@ unsafe impl Send for EmbedPipe {}
 unsafe impl Sync for EmbedPipe {}
 
 impl EmbedPipe {
-    /// Create the server end and block until a consumer connects.
-    pub(crate) fn serve(name: &str) -> Result<Self> {
-        let pipe = Self::create(name)?;
-        pipe.accept()?;
-        Ok(pipe)
-    }
-
     /// Create one instance of the server pipe, not yet connected.
     ///
     /// `PIPE_UNLIMITED_INSTANCES`, because one zed serves every pane: each
@@ -324,6 +318,104 @@ impl Drop for EmbedPipe {
             }
         }
     }
+}
+
+/// Host connections accepted but not yet bound to a window.
+///
+/// One editor serves every pane, so a connection cannot be a single thing the
+/// platform owns: each consumer gets its own pipe instance, its own window and
+/// its own frame pump. The accept loop queues them here and bumps gpui's
+/// connection counter; zed's `init_embed_windows` asks for one window per count,
+/// and `open_window` pops the connection that window belongs to.
+static PENDING_CONNECTIONS: Mutex<VecDeque<Arc<EmbedPipe>>> = Mutex::new(VecDeque::new());
+
+/// Held across "push the path, queue the pipe, bump the counter", so those three
+/// stay in step when two consumers arrive at once — the app pairs the Nth path
+/// with the Nth connection, and interleaving them would open each window on the
+/// other's project.
+static ENQUEUE: Mutex<()> = Mutex::new(());
+
+/// The consumer a copy inside the editor is forwarded to: the most recently
+/// bound one, mirroring the Linux producer's `CLIPBOARD_WRITER`.
+///
+/// `write_to_clipboard` is told a clipboard item and nothing else — there is no
+/// window argument to route by — and the host owns the real system clipboard, so
+/// the copy has to travel to one of them.
+pub(crate) static CLIPBOARD_PIPE: Mutex<Option<Arc<EmbedPipe>>> = Mutex::new(None);
+
+/// Start the embed accept loop.
+///
+/// Returns once the FIRST instance exists rather than once a consumer has
+/// connected: the host probes the name for liveness before it connects (and
+/// before it spawns an editor of its own), so the name has to answer as soon as
+/// this returns.
+pub(crate) fn spawn_listener(name: &str) -> Result<()> {
+    let first = EmbedPipe::create(name)?;
+    let name = name.to_owned();
+    std::thread::Builder::new()
+        .name("zed-embed-accept".into())
+        .spawn(move || {
+            let mut pipe = first;
+            loop {
+                if let Err(error) = pipe.accept() {
+                    log::error!("[zed-embed] accept on {name} failed: {error:#}");
+                    return;
+                }
+                // The successor instance BEFORE this one is handed off. A named
+                // pipe serves one client per instance, so for as long as the
+                // accepted instance is the only one the name exists under, every
+                // other consumer is turned away with ERROR_PIPE_BUSY and the
+                // host's liveness probe reports no editor at all. Creating it
+                // first leaves an unconnected instance for them to open; a client
+                // that gets in before the `accept` below surfaces there as
+                // ERROR_PIPE_CONNECTED, which that path already handles.
+                let next = match EmbedPipe::create(&name) {
+                    Ok(next) => next,
+                    Err(error) => {
+                        log::error!("[zed-embed] creating the next instance of {name}: {error:#}");
+                        return;
+                    }
+                };
+                let connected = Arc::new(std::mem::replace(&mut pipe, next));
+                // On its own thread, because the cwd is the consumer's first
+                // message: a consumer slow to send it would otherwise stall every
+                // accept behind it.
+                std::thread::spawn(move || {
+                    let path = match read_cwd(&connected) {
+                        Ok(path) => path,
+                        // Hung up before naming anything. Not a consumer — a
+                        // probe, or a client that gave up — and counting it would
+                        // open an empty window and hand it the queue slot the
+                        // next real consumer is waiting for.
+                        Err(error) => {
+                            log::info!(
+                                "[zed-embed] a connection closed before naming a project: {error:#}"
+                            );
+                            return;
+                        }
+                    };
+                    log::info!("[zed-embed] consumer connected for {path:?}");
+                    let _guard = ENQUEUE.lock();
+                    gpui::embed_palette::push_embed_path(path);
+                    PENDING_CONNECTIONS.lock().push_back(connected);
+                    // Last, and after the queues above are populated: this is
+                    // what makes the app ask for a window, and that window pops
+                    // both of them.
+                    gpui::embed_palette::note_embed_connection();
+                });
+            }
+        })
+        .context("spawning the embed accept thread")?;
+    Ok(())
+}
+
+/// Take the connection the next embed window belongs to, if one is waiting.
+///
+/// `None` is the ordinary answer for a window zed opened of its own accord — its
+/// settings window, say — which is why that case becomes a real on-screen window
+/// rather than an error.
+pub(crate) fn take_pending_connection() -> Option<Arc<EmbedPipe>> {
+    PENDING_CONNECTIONS.lock().pop_front()
 }
 
 /// Log a stack trace when the process dies from an OS-level exception.
@@ -626,7 +718,20 @@ pub(crate) fn read_input(pipe: &EmbedPipe) -> Result<EmbedInput> {
 ///
 /// The pipe cannot be serviced from the GPUI main thread: that thread is inside
 /// `GetMessageW`, and blocking it on a read would stop the message loop.
-pub(crate) fn spawn_reader(pipe: Arc<EmbedPipe>) -> Receiver<EmbedInput> {
+///
+/// `wake` is signalled after every message so the foreground can drain the queue
+/// as input ARRIVES. It is deliberately not the frame clock: gating dispatch on
+/// the clock quantises input to the render rate and, worse, loses it whenever a
+/// tick is dropped, which is exactly what a busy foreground does. See the input
+/// pump in `open_embed_window`.
+///
+/// Capacity 1 and `try_send`: a wake already queued is a drain that has not run
+/// yet, and that drain empties the whole queue, so dropping this one loses
+/// nothing.
+pub(crate) fn spawn_reader(
+    pipe: Arc<EmbedPipe>,
+    mut wake: futures::channel::mpsc::Sender<()>,
+) -> Receiver<EmbedInput> {
     let (sender, receiver): (Sender<EmbedInput>, Receiver<EmbedInput>) = channel();
     std::thread::Builder::new()
         .name("zed-embed-reader".into())
@@ -637,6 +742,7 @@ pub(crate) fn spawn_reader(pipe: Arc<EmbedPipe>) -> Receiver<EmbedInput> {
                         if sender.send(input).is_err() {
                             break;
                         }
+                        let _ = wake.try_send(());
                     }
                     Err(error) => {
                         log::info!("[zed-embed] input stream ended: {error:#}");
@@ -647,6 +753,41 @@ pub(crate) fn spawn_reader(pipe: Arc<EmbedPipe>) -> Receiver<EmbedInput> {
         })
         .expect("spawning the embed reader thread");
     receiver
+}
+
+/// Sum adjacent scroll messages of the same kind into one.
+///
+/// A drain can hold several scroll messages: a precision touchpad reports faster
+/// than the foreground can answer, and any hitch queues more. They are one
+/// movement of the user's fingers, and handing them over whole is what the
+/// editor expects -- it locks a trackpad gesture to an axis from the delta of a
+/// single event and only re-decides after a pause, so feeding it the fragments
+/// separately lets a momentarily sideways one flip the lock mid-flick.
+///
+/// Adjacent only, and the two kinds never merge: order against pointer, key and
+/// resize messages is preserved, and notches and pixels are different units.
+pub(crate) fn coalesce_scrolls(batch: &mut Vec<EmbedInput>) {
+    batch.dedup_by(|next, prev| match (next, prev) {
+        (
+            EmbedInput::Scroll { dx, dy },
+            EmbedInput::Scroll {
+                dx: total_x,
+                dy: total_y,
+            },
+        )
+        | (
+            EmbedInput::ScrollPixels { dx, dy },
+            EmbedInput::ScrollPixels {
+                dx: total_x,
+                dy: total_y,
+            },
+        ) => {
+            *total_x += *dx;
+            *total_y += *dy;
+            true
+        }
+        _ => false,
+    });
 }
 
 /// Button numbers are GTK/GDK's: 1 left, 2 middle, 3 right, 8 back, 9 forward
