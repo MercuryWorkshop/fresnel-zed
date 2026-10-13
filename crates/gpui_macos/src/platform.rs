@@ -279,7 +279,8 @@ impl MacPlatform {
     }
 
     /// Bind a queued consumer to an offscreen window and run the session: frames
-    /// out on a fixed clock, forwarded input in, until either side goes away.
+    /// out on the display's vsync, forwarded input in as it arrives, until either
+    /// side goes away.
     fn open_embed_window(
         &self,
         options: WindowParams,
@@ -366,17 +367,81 @@ impl MacPlatform {
             }
         }));
 
-        let receiver = crate::embed::spawn_reader(reader);
+        let (input_tx, mut input_rx) = futures::channel::mpsc::channel::<()>(1);
+        let receiver = crate::embed::spawn_reader(reader, input_tx);
         let weak = window.downgrade();
         let (tick_tx, mut tick_rx) = futures::channel::mpsc::channel::<()>(0);
-        spawn_embed_frame_clock(tick_tx);
+        let frame_clock = spawn_embed_frame_clock(tick_tx);
+        // Which cursor this window's consumer was last sent, shared by the two
+        // pumps below. Both run on the one foreground thread, so a `Cell` is all
+        // the sharing needs.
+        let last_cursor: Rc<Cell<Option<&'static str>>> = Rc::new(Cell::new(None));
 
+        // Input is pumped by ARRIVAL, not by the frame clock.
+        //
+        // Draining it from the clock quantised every message to the render rate,
+        // and a dropped tick -- which is what a busy foreground does, by design --
+        // dropped that drain with it. A trackpad reports faster than the display
+        // refreshes, and the editor re-decides which axis a gesture is locked to
+        // after a short pause, so the gaps a skipped tick opens up re-lock the
+        // axis mid-flick. A native window has no such coupling: AppKit dispatches
+        // an `NSEvent` when it arrives.
+        foreground_executor
+            .spawn({
+                let weak = weak.clone();
+                let socket = socket.clone();
+                let last_cursor = last_cursor.clone();
+                async move {
+                    use futures::StreamExt as _;
+
+                    let mut input_state = crate::embed::EmbedInputState::new(frame_clock);
+                    loop {
+                        // `None` means the reader thread is gone, which is how a
+                        // consumer that hung up reaches us. Whatever it managed to
+                        // send first is still drained below before closing.
+                        let alive = input_rx.next().await.is_some();
+                        let Some(window) = weak.upgrade() else {
+                            break;
+                        };
+                        let mut batch = Vec::new();
+                        let mut disconnected = !alive;
+                        loop {
+                            match receiver.try_recv() {
+                                Ok(input) => batch.push(input),
+                                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    disconnected = true;
+                                    break;
+                                }
+                            }
+                        }
+                        crate::embed::coalesce_scrolls(&mut batch);
+                        // The same per-window cursor routing as the frame pump:
+                        // clear the shared slot, do this window's work, send what
+                        // it asked for.
+                        *crate::embed::PENDING_CURSOR.lock() = None;
+                        window.ensure_active();
+                        for input in batch {
+                            input_state.apply(input, &window);
+                        }
+                        flush_embed_cursor(&socket, &last_cursor);
+                        if disconnected {
+                            log::info!("[zed-embed] consumer disconnected; closing");
+                            socket.shutdown();
+                            window.close();
+                            return;
+                        }
+                    }
+                }
+            })
+            .detach();
+
+        // Dropping a tick is only ever a dropped FRAME: input no longer rides on
+        // this clock, so a hitch costs a repaint and nothing else.
         foreground_executor
             .spawn(async move {
                 use futures::StreamExt as _;
 
-                let mut input_state = crate::embed::EmbedInputState::default();
-                let mut last_cursor: Option<&'static str> = None;
                 loop {
                     if tick_rx.next().await.is_none() {
                         break;
@@ -384,34 +449,16 @@ impl MacPlatform {
                     let Some(window) = weak.upgrade() else {
                         break;
                     };
+                    // Clear the shared slot so this tick captures only the cursor
+                    // gpui sets for THIS window's paint. `set_cursor_style` names no
+                    // window, but the pumps run on the one foreground thread and so
+                    // never interleave -- which is what makes "whatever landed
+                    // during my turn is mine" true, and what keeps two panes from
+                    // both showing the last-opened one's cursor.
+                    *crate::embed::PENDING_CURSOR.lock() = None;
                     window.ensure_active();
-                    loop {
-                        match receiver.try_recv() {
-                            Ok(input) => {
-                                input_state.apply(input, &window);
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                log::info!("[zed-embed] consumer disconnected; closing");
-                                socket.shutdown();
-                                window.close();
-                                return;
-                            }
-                        }
-                    }
-                    // Whatever this tick's layout asked for, at most one message.
-                    let pending = crate::embed::PENDING_CURSOR.lock().take();
-                    if let Some(name) = pending
-                        && last_cursor != Some(name)
-                    {
-                        match crate::embed::send_cursor(&socket, name) {
-                            Ok(()) => last_cursor = Some(name),
-                            Err(error) => {
-                                log::error!("[zed-embed] cursor update failed: {error:#}")
-                            }
-                        }
-                    }
                     window.tick_frame();
+                    flush_embed_cursor(&socket, &last_cursor);
                 }
             })
             .detach();
@@ -1472,20 +1519,36 @@ struct EmbedFrameClock {
     display: Option<CGDirectDisplayID>,
 }
 
-thread_local! {
-    /// The live embed session's clock, for [`retarget_embed_frame_clock`].
-    ///
-    /// One per process because one process serves one embed session — `EmbedSession`
-    /// is claimed by the first `open_window` and every later window opens normally —
-    /// and thread-local because the pointer is only ever touched on the main thread:
-    /// `spawn_embed_frame_clock` runs there from `open_window`, the tick handler is
-    /// on the main queue, and the input drain that retargets is a
-    /// `foreground_executor` task.
-    static EMBED_FRAME_CLOCK: Cell<*mut EmbedFrameClock> =
-        const { Cell::new(ptr::null_mut()) };
+/// One embed window's clock, for [`retarget_embed_frame_clock`].
+///
+/// One per window rather than one per process, because one editor serves every
+/// pane and each pane can be on a different display. Only ever dereferenced on
+/// the main thread: `spawn_embed_frame_clock` runs there from `open_window`, the
+/// tick handler is on the main queue, and the input drain that retargets is a
+/// `foreground_executor` task.
+#[derive(Clone, Copy)]
+pub(crate) struct EmbedFrameClockHandle(*mut EmbedFrameClock);
+
+/// Send whatever cursor the work just done asked for to one window's consumer.
+///
+/// gpui sets the cursor several times per paint, and `set_cursor_style` names no
+/// window, so the producer stashes the latest in `PENDING_CURSOR` and the pumps
+/// flush it: clear the slot, do one window's work, send what landed. `last` is
+/// that window's last-sent name, so an unchanged cursor costs no message.
+fn flush_embed_cursor(socket: &EmbedSocket, last: &Cell<Option<&'static str>>) {
+    let Some(name) = *crate::embed::PENDING_CURSOR.lock() else {
+        return;
+    };
+    if last.get() == Some(name) {
+        return;
+    }
+    match crate::embed::send_cursor(socket, name) {
+        Ok(()) => last.set(Some(name)),
+        Err(error) => log::error!("[zed-embed] cursor update failed: {error:#}"),
+    }
 }
 
-/// Move an embed session's frame pacing onto `display_id`, the display the consumer
+/// Move an embed window's frame pacing onto `display_id`, the display the consumer
 /// says the pane is actually on.
 ///
 /// The consumer is the only side that knows: a producer window is offscreen, so it
@@ -1498,17 +1561,12 @@ thread_local! {
 /// Cheap to call repeatedly: the consumer sends this on attach and on every screen
 /// change, and a repeat of the current display returns without touching the
 /// registry.
-pub(crate) fn retarget_embed_frame_clock(display_id: u32) {
+pub(crate) fn retarget_embed_frame_clock(handle: EmbedFrameClockHandle, display_id: u32) {
     let display_id = display_id as CGDirectDisplayID;
-    let clock = EMBED_FRAME_CLOCK.get();
-    if clock.is_null() {
-        return;
-    }
     // SAFETY: the pointer is the clock leaked by `spawn_embed_frame_clock`, which is
-    // never freed, and this thread-local is only read on the thread that set it —
-    // the same main thread the tick handler runs on, so there is no concurrent
-    // borrow.
-    let clock = unsafe { &mut *clock };
+    // never freed, and the handle is only used on the main thread — the same thread
+    // the tick handler runs on, so there is no concurrent borrow.
+    let clock = unsafe { &mut *handle.0 };
     if clock.display == Some(display_id) {
         return;
     }
@@ -1599,17 +1657,16 @@ impl EmbedFrameClock {
 /// than the one the pane is on costs frames the consumer can never get back. The
 /// consumer corrects it with a `Display` message as soon as it attaches; see
 /// [`retarget_embed_frame_clock`].
-fn spawn_embed_frame_clock(ticks: futures::channel::mpsc::Sender<()>) {
-    let clock = Box::into_raw(Box::new(EmbedFrameClock {
+fn spawn_embed_frame_clock(ticks: futures::channel::mpsc::Sender<()>) -> EmbedFrameClockHandle {
+    let handle = EmbedFrameClockHandle(Box::into_raw(Box::new(EmbedFrameClock {
         ticks,
         frames: None,
         display: None,
-    }));
-    EMBED_FRAME_CLOCK.set(clock);
-    // SAFETY: `clock` was just allocated here and nothing else refers to it. The
-    // dispatch source below targets the main queue, so `embed_frame_clock_tick`
-    // runs serially on this thread and is the only other reader.
-    let clock = unsafe { &mut *clock };
+    })));
+    // SAFETY: `handle` was just allocated here and nothing else refers to it yet.
+    // The dispatch source below targets the main queue, so `embed_frame_clock_tick`
+    // runs serially on this thread, as does every retarget through the handle.
+    let clock = unsafe { &mut *handle.0 };
     let mut frames = crate::WindowFrameSource::new(
         clock as *mut EmbedFrameClock as *mut c_void,
         embed_frame_clock_tick,
@@ -1651,6 +1708,7 @@ fn spawn_embed_frame_clock(ticks: futures::channel::mpsc::Sender<()>) {
             }
         }
     }
+    handle
 }
 
 /// One vsync on the main display, delivered on the main queue.

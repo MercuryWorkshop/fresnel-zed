@@ -406,7 +406,20 @@ fn read_input(reader: &mut impl Read) -> Result<EmbedInput> {
 ///
 /// The socket cannot be serviced from the GPUI main thread: that thread is inside
 /// `CFRunLoopRun`, and blocking it on a read would stop the run loop.
-pub(crate) fn spawn_reader(mut reader: UnixStream) -> Receiver<EmbedInput> {
+///
+/// `wake` is signalled after every message so the foreground can drain the queue
+/// as input ARRIVES. It is deliberately not the frame clock: gating dispatch on
+/// the clock quantises input to the render rate and, worse, loses it whenever a
+/// tick is dropped, which is exactly what a busy foreground does. See the input
+/// pump in `open_embed_window`.
+///
+/// Capacity 1 and `try_send`: a wake already queued is a drain that has not run
+/// yet, and that drain empties the whole queue, so dropping this one loses
+/// nothing.
+pub(crate) fn spawn_reader(
+    mut reader: UnixStream,
+    mut wake: futures::channel::mpsc::Sender<()>,
+) -> Receiver<EmbedInput> {
     let (sender, receiver): (Sender<EmbedInput>, Receiver<EmbedInput>) = channel();
     if let Err(error) = std::thread::Builder::new()
         .name("zed-embed-reader".into())
@@ -415,6 +428,11 @@ pub(crate) fn spawn_reader(mut reader: UnixStream) -> Receiver<EmbedInput> {
                 match read_input(&mut reader) {
                     Ok(input) => {
                         if sender.send(input).is_err() {
+                            break;
+                        }
+                        if let Err(error) = wake.try_send(())
+                            && error.is_disconnected()
+                        {
                             break;
                         }
                     }
@@ -426,12 +444,47 @@ pub(crate) fn spawn_reader(mut reader: UnixStream) -> Receiver<EmbedInput> {
             }
         })
     {
-        // The sender goes with the closure, so the receiver reports a
-        // disconnected consumer and the frame clock closes the window rather
-        // than running a session that can never see input.
+        // The sender and the wake go with the closure, so the input pump sees a
+        // disconnected consumer and closes the window rather than running a
+        // session that can never see input.
         log::error!("[zed-embed] spawning the input reader thread failed: {error}");
     }
     receiver
+}
+
+/// Sum adjacent scroll messages of the same kind into one.
+///
+/// A drain can hold several scroll messages: a trackpad reports faster than the
+/// foreground can answer, and any hitch queues more. They are one movement of
+/// the user's fingers, and handing them over whole is what the editor expects --
+/// it locks a trackpad gesture to an axis from the delta of a single event and
+/// only re-decides after a pause, so feeding it the fragments separately lets a
+/// momentarily sideways one flip the lock mid-flick.
+///
+/// Adjacent only, and the two kinds never merge: order against pointer, key and
+/// resize messages is preserved, and notches and pixels are different units.
+pub(crate) fn coalesce_scrolls(batch: &mut Vec<EmbedInput>) {
+    batch.dedup_by(|next, previous| match (next, previous) {
+        (
+            EmbedInput::Scroll { dx, dy },
+            EmbedInput::Scroll {
+                dx: total_x,
+                dy: total_y,
+            },
+        )
+        | (
+            EmbedInput::ScrollPixels { dx, dy },
+            EmbedInput::ScrollPixels {
+                dx: total_x,
+                dy: total_y,
+            },
+        ) => {
+            *total_x += *dx;
+            *total_y += *dy;
+            true
+        }
+        _ => false,
+    });
 }
 
 /// Button numbers are GTK/GDK's: 1 left, 2 middle, 3 right, 8 back, 9 forward
@@ -450,13 +503,25 @@ fn mouse_button(button: u8) -> MouseButton {
 /// GPUI mouse events carry the current position and held button, but the wire
 /// protocol reports moves and buttons separately — so the last of each has to be
 /// remembered between messages.
-#[derive(Default)]
 pub(crate) struct EmbedInputState {
     position: Point<Pixels>,
     pressed_button: Option<MouseButton>,
+    /// This window's own frame clock. One editor serves every pane, each pane
+    /// may be on a different display, and the `Display` message names the one
+    /// its consumer is on — so it has to move this window's pacing, not
+    /// whichever window opened last.
+    frame_clock: crate::platform::EmbedFrameClockHandle,
 }
 
 impl EmbedInputState {
+    pub(crate) fn new(frame_clock: crate::platform::EmbedFrameClockHandle) -> Self {
+        Self {
+            position: Point::default(),
+            pressed_button: None,
+            frame_clock,
+        }
+    }
+
     /// Apply one decoded message to the window. Returns false when the message
     /// was consumed here (resize, palette, clipboard) rather than dispatched.
     pub(crate) fn apply(&mut self, input: EmbedInput, window: &EmbedWindow) -> bool {
@@ -570,7 +635,7 @@ impl EmbedInputState {
                 return false;
             }
             EmbedInput::Display { display_id } => {
-                crate::platform::retarget_embed_frame_clock(display_id);
+                crate::platform::retarget_embed_frame_clock(self.frame_clock, display_id);
                 return false;
             }
         }
